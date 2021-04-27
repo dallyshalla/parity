@@ -1,94 +1,107 @@
-// Copyright 2015, 2016 Ethcore (UK) Ltd.
-// This file is part of Parity.
+// Copyright 2015-2020 Parity Technologies (UK) Ltd.
+// This file is part of Open Ethereum.
 
-// Parity is free software: you can redistribute it and/or modify
+// Open Ethereum is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 
-// Parity is distributed in the hope that it will be useful,
+// Open Ethereum is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 // GNU General Public License for more details.
 
 // You should have received a copy of the GNU General Public License
-// along with Parity.  If not, see <http://www.gnu.org/licenses/>.
+// along with Open Ethereum.  If not, see <http://www.gnu.org/licenses/>.
 
+use std::path::Path;
 use super::test_common::*;
-use evm;
+use test_helpers::EvmTestClient;
+use ethjson;
+use rlp::Rlp;
+use types::{
+	header::Header,
+	errors::EthcoreError as Error,
+	transaction::UnverifiedTransaction
+};
+use machine::transaction_ext::Transaction;
 
-fn do_json_test(json_data: &[u8]) -> Vec<String> {
-	let json = Json::from_str(::std::str::from_utf8(json_data).unwrap()).expect("Json is invalid");
+#[allow(dead_code)]
+fn do_json_test<H: FnMut(&str, HookType)>(path: &Path, json_data: &[u8], start_stop_hook: &mut H) -> Vec<String> {
+	// Block number used to run the tests.
+	// Make sure that all the specified features are activated.
+	const BLOCK_NUMBER: u64 = 0x6ffffffffffffe;
+
+	let tests = ethjson::test_helpers::transaction::Test::load(json_data)
+		.expect(&format!("Could not parse JSON transaction test data from {}", path.display()));
 	let mut failed = Vec::new();
-	let old_schedule = evm::Schedule::new_frontier();
-	let new_schedule = evm::Schedule::new_homestead();
-	let ot = RefCell::new(None);
-	for (name, test) in json.as_object().unwrap() {
-		let mut fail = false;
-		let mut fail_unless = |cond: bool| if !cond && !fail { failed.push(name.clone()); println!("Transaction: {:?}", ot.borrow()); fail = true };
-		let schedule = match test.find("blocknumber")
-			.and_then(|j| j.as_string())
-			.and_then(|s| BlockNumber::from_str(s).ok())
-			.unwrap_or(0) { x if x < 1_000_000 => &old_schedule, _ => &new_schedule };
-		let rlp = Bytes::from_json(&test["rlp"]);
-		let res = UntrustedRlp::new(&rlp).as_val().map_err(From::from).and_then(|t: SignedTransaction| t.validate(schedule, schedule.have_delegate_call));
-		fail_unless(test.find("transaction").is_none() == res.is_err());
-		if let (Some(&Json::Object(ref tx)), Some(&Json::String(ref expect_sender))) = (test.find("transaction"), test.find("sender")) {
-			let t = res.unwrap();
-			fail_unless(t.sender().unwrap() == address_from_hex(clean(expect_sender)));
-			fail_unless(t.data == Bytes::from_json(&tx["data"]));
-			fail_unless(t.gas == xjson!(&tx["gasLimit"]));
-			fail_unless(t.gas_price == xjson!(&tx["gasPrice"]));
-			fail_unless(t.nonce == xjson!(&tx["nonce"]));
-			fail_unless(t.value == xjson!(&tx["value"]));
-			if let Action::Call(ref to) = t.action {
-				*ot.borrow_mut() = Some(t.clone());
-				fail_unless(to == &xjson!(&tx["to"]));
-			} else {
-				*ot.borrow_mut() = Some(t.clone());
-				fail_unless(Bytes::from_json(&tx["to"]).is_empty());
+	for (name, test) in tests.into_iter() {
+		start_stop_hook(&name, HookType::OnStart);
+
+		for (spec_name, result) in test.post_state {
+			let spec = match EvmTestClient::fork_spec_from_json(&spec_name) {
+				Some(spec) => spec,
+				None => {
+					println!("   - {} | {:?} Ignoring tests because of missing spec", name, spec_name);
+					continue;
+				}
+			};
+
+			let mut fail_unless = |cond: bool, title: &str| if !cond {
+				failed.push(format!("{}-{:?}", name, spec_name));
+				println!("Transaction failed: {:?}-{:?}: {:?}", name, spec_name, title);
+			};
+
+			let rlp: Vec<u8> = test.rlp.clone().into();
+			let res = Rlp::new(&rlp)
+				.as_val()
+				.map_err(Error::from)
+				.and_then(|t: UnverifiedTransaction| {
+					let mut header: Header = Default::default();
+					// Use high enough number to activate all required features.
+					header.set_number(BLOCK_NUMBER);
+
+					let minimal = t.gas_required(&spec.engine.schedule(header.number())).into();
+					if t.gas < minimal {
+						return Err(::types::transaction::Error::InsufficientGas {
+							minimal, got: t.gas,
+						}.into());
+					}
+					spec.engine.verify_transaction_basic(&t, &header)?;
+					Ok(t.verify_unordered()?)
+				});
+
+			match (res, result.hash, result.sender) {
+				(Ok(t), Some(hash), Some(sender)) => {
+					fail_unless(t.sender() == sender.into(), "sender mismatch");
+					fail_unless(t.hash() == hash.into(), "hash mismatch");
+				},
+				(Err(_), None, None) => {},
+				data => {
+					fail_unless(
+						false,
+						&format!("Validity different: {:?}", data)
+					);
+				}
 			}
 		}
+
+		start_stop_hook(&name, HookType::OnStop);
 	}
+
 	for f in &failed {
 		println!("FAILED: {:?}", f);
 	}
 	failed
 }
 
-// Once we have interpolate idents.
-/*macro_rules! declare_test {
-	($test_set_name: ident / $name: ident) => {
-		#[test]
-		#[allow(non_snake_case)]
-		fn $name() {
-			assert!(do_json_test(include_bytes!(concat!("../res/ethereum/tests/", stringify!($test_set_name), "/", stringify!($name), ".json"))).len() == 0);
-		}
-	};
-	($test_set_name: ident / $prename: ident / $name: ident) => {
-		#[test]
-		#[allow(non_snake_case)]
-		interpolate_idents! { fn [$prename _ $name]()
-			{
-				let json = include_bytes!(concat!("../res/ethereum/tests/", stringify!($test_set_name), "/", stringify!($prename), "/", stringify!($name), ".json"));
-				assert!(do_json_test(json).len() == 0);
-			}
-		}
-	};
-}
-
-declare_test!{TransactionTests/ttTransactionTest}
-declare_test!{TransactionTests/tt10mbDataField}
-declare_test!{TransactionTests/ttWrongRLPTransaction}
-declare_test!{TransactionTests/Homestead/ttTransactionTest}
-declare_test!{heavy => TransactionTests/Homestead/tt10mbDataField}
-declare_test!{TransactionTests/Homestead/ttWrongRLPTransaction}
-declare_test!{TransactionTests/RandomTests/tr201506052141PYTHON}*/
-
-declare_test!{TransactionTests_ttTransactionTest, "TransactionTests/ttTransactionTest"}
-declare_test!{heavy => TransactionTests_tt10mbDataField, "TransactionTests/tt10mbDataField"}
-declare_test!{TransactionTests_ttWrongRLPTransaction, "TransactionTests/ttWrongRLPTransaction"}
-declare_test!{TransactionTests_Homestead_ttTransactionTest, "TransactionTests/Homestead/ttTransactionTest"}
-declare_test!{heavy => TransactionTests_Homestead_tt10mbDataField, "TransactionTests/Homestead/tt10mbDataField"}
-declare_test!{TransactionTests_Homestead_ttWrongRLPTransaction, "TransactionTests/Homestead/ttWrongRLPTransaction"}
-declare_test!{TransactionTests_RandomTests_tr201506052141PYTHON, "TransactionTests/RandomTests/tr201506052141PYTHON"}
+declare_test!{TransactionTests_ttAddress, "TransactionTests/ttAddress"}
+declare_test!{TransactionTests_ttData, "TransactionTests/ttData"}
+declare_test!{TransactionTests_ttGasLimit, "TransactionTests/ttGasLimit"}
+declare_test!{TransactionTests_ttGasPrice, "TransactionTests/ttGasPrice"}
+declare_test!{TransactionTests_ttNonce, "TransactionTests/ttNonce"}
+declare_test!{TransactionTests_ttRSValue, "TransactionTests/ttRSValue"}
+declare_test!{TransactionTests_ttSignature, "TransactionTests/ttSignature"}
+declare_test!{TransactionTests_ttValue, "TransactionTests/ttValue"}
+declare_test!{TransactionTests_ttVValue, "TransactionTests/ttVValue"}
+declare_test!{TransactionTests_ttWrongRLP, "TransactionTests/ttWrongRLP"}

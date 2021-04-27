@@ -1,52 +1,62 @@
-// Copyright 2015, 2016 Ethcore (UK) Ltd.
-// This file is part of Parity.
+// Copyright 2015-2020 Parity Technologies (UK) Ltd.
+// This file is part of Open Ethereum.
 
-// Parity is free software: you can redistribute it and/or modify
+// Open Ethereum is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 
-// Parity is distributed in the hope that it will be useful,
+// Open Ethereum is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 // GNU General Public License for more details.
 
 // You should have received a copy of the GNU General Public License
-// along with Parity.  If not, see <http://www.gnu.org/licenses/>.
+// along with Open Ethereum.  If not, see <http://www.gnu.org/licenses/>.
 
-use serde::{Deserialize, Deserializer, Error};
-use serde::de::Visitor;
+use std::fmt;
+use serde::{Deserialize, Deserializer};
+use serde::de::{Error, Visitor};
 
 /// Represents usize.
 #[derive(Debug, PartialEq)]
 pub struct Index(usize);
 
 impl Index {
+	/// Convert to usize
 	pub fn value(&self) -> usize {
 		self.0
 	}
 }
 
-impl Deserialize for Index {
-	fn deserialize<D>(deserializer: &mut D) -> Result<Index, D::Error>
-	where D: Deserializer {
-		deserializer.visit(IndexVisitor)
+impl<'a> Deserialize<'a> for Index {
+	fn deserialize<D>(deserializer: D) -> Result<Index, D::Error>
+	where D: Deserializer<'a> {
+		deserializer.deserialize_any(IndexVisitor)
 	}
 }
 
 struct IndexVisitor;
 
-impl Visitor for IndexVisitor {
+impl<'a> Visitor<'a> for IndexVisitor {
 	type Value = Index;
 
-	fn visit_str<E>(&mut self, value: &str) -> Result<Self::Value, E> where E: Error {
+	fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+		write!(formatter, "a hex-encoded or decimal index")
+	}
+
+	fn visit_str<E>(self, value: &str) -> Result<Self::Value, E> where E: Error {
 		match value {
-			_ if value.starts_with("0x") => usize::from_str_radix(&value[2..], 16).map(Index).map_err(|_| Error::syntax("invalid index")),
-			_ => value.parse::<usize>().map(Index).map_err(|_| Error::syntax("invalid index"))
+			_ if value.starts_with("0x") => usize::from_str_radix(&value[2..], 16).map(Index).map_err(|e| {
+				Error::custom(format!("Invalid index: {}", e))
+			}),
+			_ => value.parse::<usize>().map(Index).map_err(|e| {
+				Error::custom(format!("Invalid index: {}", e))
+			}),
 		}
 	}
 
-	fn visit_string<E>(&mut self, value: String) -> Result<Self::Value, E> where E: Error {
+	fn visit_string<E>(self, value: String) -> Result<Self::Value, E> where E: Error {
 		self.visit_str(value.as_ref())
 	}
 }
@@ -63,4 +73,3 @@ mod tests {
 		assert_eq!(deserialized, vec![Index(10), Index(10)]);
 	}
 }
-
